@@ -1,0 +1,128 @@
+# ~/litellm/config.yaml — orchestration gateway for Claude Code.
+# Expensive AGENTIC brain plans + delegates; cheap hands execute.
+#
+#   ROLE          MODEL          BACKEND            COST/M in-out    WHY
+#   glm-planner   GLM-5.2        Z.ai API           ~$0.56-1.2 / 1.76-4.4  orchestrator: near-Opus agentic (MCP-Atlas 77 vs 77.8)
+#   ds-coder      DeepSeek V4Pro deepseek.com       $0.44 / $0.87    heavy executor: best cheap coder (SWE-Verified 80.6, LiveCodeBench 93.5)
+#   local-coder   Qwen3-Coder    LM Studio (local)  free             mechanical executor + quick tasks
+#   claude-smart  Sonnet 5       anthropic.com      $3 / $15*        frontier escalation (/model opus) when stuck
+#     * $2/$10 intro through 2026-08-31.
+#
+# Claude Code mapping (via claude-hybrid.sh env vars):
+#   main loop (planner)    → glm-planner   (auto-degrades to ds-coder if ZAI_API_KEY missing)
+#   subagent model: haiku  → local-coder   (Qwen, mechanical execution)
+#   subagent model: sonnet → ds-coder      (DeepSeek, heavy execution)
+#   subagent model: inherit→ glm-planner   (same as main)
+#   /model opus            → claude-smart  (Sonnet 5, frontier escalation)
+# You can also type a role name directly, e.g. `/model ds-coder`.
+# `smart_router` only auto-escalates a local-coder (Qwen) executor → ds-coder
+# when its task is complex/large. The GLM planner and Anthropic tier are direct.
+#
+# KEYS in litellm.env: ZAI_API_KEY (planner — REQUIRED), DEEPSEEK_API_KEY,
+# ANTHROPIC_API_KEY (optional, only /model opus). A missing key = that model
+# 401s but the proxy still starts and the other tiers keep working.
+#
+# PREREQ: Qwen loaded in LM Studio at --context-length 65536 (claude-hybrid.sh
+# auto-checks). Model IDs verified vs litellm 1.91.0 zai/deepseek/anthropic
+# providers. Only DeepSeek V4 Pro is used (thinks natively — no reasoner SKU).
+
+model_list:
+  # ── ORCHESTRATOR · glm-planner — GLM-5.2 (Z.ai, pay-per-token) ──
+  # Near-Opus agentic tool orchestration (MCP-Atlas 77.0 vs Opus 4.8's 77.8),
+  # Terminal-Bench 2.1 81.0. This is the planner/delegator. 1M context.
+  # Needs ZAI_API_KEY in litellm.env (from z.ai / bigmodel console).
+  - model_name: glm-planner
+    litellm_params:
+      model: zai/glm-5.2
+      api_key: os.environ/ZAI_API_KEY
+      api_base: https://api.z.ai/api/paas/v4   # general pay-per-token endpoint
+      timeout: 600
+      rpm: 30
+    model_info:
+      mode: chat
+      max_input_tokens: 200000
+      max_output_tokens: 65536
+      # Fallback estimate only — z.ai returns real response_cost per call (that's
+      # what usage.db logs). Set to OBSERVED effective rate from usage.db 2026-07-06
+      # ($0.144/M blended, cache-heavy) so the rare fallback path isn't 4x high.
+      input_cost_per_token: 0.00000015    # ~$0.15/M observed effective (list ~$0.56, caching pulls it down)
+      output_cost_per_token: 0.00000176   # $1.76/M
+
+  # ── TIER 0 · local-coder — Qwen3 Coder 30B (free, LM Studio :1234) ──
+  - model_name: local-coder
+    litellm_params:
+      model: lm_studio/qwen/qwen3-coder-30b
+      api_base: http://127.0.0.1:1234/v1
+      api_key: "sk-noop"
+      timeout: 600
+    model_info:
+      mode: chat
+      supports_vision: false
+      supports_function_calling: true
+      max_input_tokens: 49152        # loaded ctx 65536 − 16384 output headroom
+      max_output_tokens: 16384
+      input_cost_per_token: 0.0      # local = free
+      output_cost_per_token: 0.0
+
+  # ── TIER 1 · ds-coder — DeepSeek V4 Pro (deepseek.com) ──
+  # max_tokens capped at 8192: DeepSeek rejects higher; Claude Code asks 32000.
+  - model_name: ds-coder
+    litellm_params:
+      model: deepseek/deepseek-v4-pro
+      api_key: os.environ/DEEPSEEK_API_KEY
+      timeout: 600
+      max_tokens: 8192
+      rpm: 30
+      tpm: 1000000
+    model_info:
+      mode: chat
+      max_input_tokens: 1000000
+      max_output_tokens: 8192
+      input_cost_per_token: 0.000000435   # $0.435/M
+      output_cost_per_token: 0.00000087   # $0.87/M
+
+  # ── TIER 2 · claude-smart — Anthropic Sonnet 5 (needs ANTHROPIC_API_KEY) ──
+  # A real console.anthropic.com key, NOT Claude Max (Max can't proxy).
+  - model_name: claude-smart
+    litellm_params:
+      model: anthropic/claude-sonnet-5
+      api_key: os.environ/ANTHROPIC_API_KEY
+      timeout: 600
+      rpm: 20
+    model_info:
+      mode: chat
+      max_input_tokens: 200000
+      max_output_tokens: 64000
+      input_cost_per_token: 0.000003      # $3/M (standard; intro $2/M through 2026-08-31)
+      output_cost_per_token: 0.000015     # $15/M (intro $10/M)
+
+router_settings:
+  routing_strategy: simple-shuffle   # one deployment per group — correct + cheapest
+  enable_pre_call_checks: true       # skip deployments whose context is too small
+  num_retries: 2
+  timeout: 600
+  allowed_fails: 3
+  cooldown_time: 30
+  fallbacks:
+    - local-coder: ["ds-coder"]      # Qwen down (LM Studio off) → DeepSeek
+  context_window_fallbacks:
+    - local-coder: ["ds-coder"]      # context too big for Qwen → DeepSeek
+  retry_policy:
+    TimeoutErrorRetries: 1
+    InternalServerErrorRetries: 2
+    APIConnectionErrorRetries: 1
+    RateLimitErrorRetries: 1
+
+litellm_settings:
+  drop_params: true
+  request_timeout: 600
+  set_verbose: false
+  json_logs: false
+  callbacks:
+    - custom_callbacks.language_pinner
+    - custom_callbacks.smart_router
+    - custom_callbacks.cost_logger   # logs model/tokens/cost/prompt → usage.db
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
+  background_health_checks: false

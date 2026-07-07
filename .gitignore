@@ -1,0 +1,18 @@
+# Secrets — NEVER commit. Copy litellm.env.example → litellm.env and fill in.
+litellm.env
+
+# Runtime data (regenerated per machine)
+usage.db
+usage.db-journal
+usage.db-wal
+usage.db-shm
+logs/
+*.html
+
+# Python virtualenv (platform-specific — recreate with pip install litellm)
+venv/
+__pycache__/
+*.pyc
+
+# OS cruft
+.DS_Store
