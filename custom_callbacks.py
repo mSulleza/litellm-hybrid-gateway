@@ -11,6 +11,7 @@ handle both shapes.
 
 import os
 import re
+import json
 from litellm.integrations.custom_logger import CustomLogger
 
 _ENGLISH_INSTRUCTION = (
@@ -36,15 +37,28 @@ def _estimate_tokens(n_chars: int) -> int:
     return n_chars // 4
 
 # Claude Code sends its session id inside the Anthropic `metadata.user_id`
-# field, which litellm surfaces as kwargs["user"]. Format is roughly
-# `user_<hash>_account_<acct>_session_<sessionUUID>`; we pull the session part.
-_SESSION_RE = re.compile(r"session_([0-9a-fA-F][0-9a-fA-F-]{5,})")
+# field, which litellm surfaces as kwargs["user"]. Current Claude Code sends it
+# as a JSON blob: {"device_id":"..","account_uuid":"..","session_id":"<uuid>"}.
+# Older versions used a flat `user_<hash>_account_<acct>_session_<uuid>` string.
+# The regex handles both the JSON `"session_id":"<uuid>"` and the legacy
+# `session_<uuid>` shapes; JSON parsing is tried first as it's exact.
+# Matches both `session_id":"<uuid>"` (JSON) and legacy `session_<uuid>` — the
+# `id":"` separator is optional so a bare `session_<uuid>` still captures.
+_SESSION_RE = re.compile(r'session_(?:id"?\s*[:=]\s*"?)?([0-9a-fA-F][0-9a-fA-F-]{5,})')
 
 def _session_id(user) -> str:
     """Extract a stable per-session id from the request's user_id string.
     Falls back to the whole user string, then '' (logged as unknown)."""
     if not user or not isinstance(user, str):
         return ""
+    # Current format: user_id is a JSON object with a session_id field.
+    try:
+        sid = json.loads(user).get("session_id")
+        if sid:
+            return sid
+    except (ValueError, TypeError, AttributeError):
+        pass
+    # Legacy flat string, or JSON we couldn't parse: pull session_id via regex.
     m = _SESSION_RE.search(user)
     return m.group(1) if m else user
 
@@ -167,22 +181,50 @@ class LanguagePinner(CustomLogger):
         _append_english(data)
         return data
 
+# ── Optional glm-planner de-escalation (OFF by default) ─────────────────────
+# Route TRIVIAL main-loop turns from GLM ($1.40/$0.26/$4.40) down to DeepSeek
+# ($0.435/$0.003625/$0.87). Enable with GLM_DEESCALATE=1 in litellm.env.
+#
+# HONEST CAVEAT (why this is off by default): cost scales with CONTEXT SIZE, and
+# this only moves SMALL, simple turns — i.e. the already-cheap ones. The
+# expensive turns are big-context ones deep in a session, which stay on GLM by
+# design (downgrading the planner's hard turns risks worse tool use → MORE turns
+# → higher cost). So savings here are marginal. The real levers are behavioral:
+# /clear between tasks and delegating reads/greps to subagents. This switch
+# exists for the execution-heavy sessions where you'd accept DeepSeek anyway.
+_GLM_DEESCALATE = os.environ.get("GLM_DEESCALATE", "").strip().lower() in ("1", "true", "yes")
+# Turns with an estimated context below this go to DeepSeek (if simple). Small
+# on purpose: only downgrade turns cheap enough that a wrong call costs little.
+_DEESCALATE_MAX_TOKENS = int(os.environ.get("GLM_DEESCALATE_MAX_TOKENS", "6000"))
+
 class SmartRouter(CustomLogger):
-    """Escalate complex local-coder requests to DeepSeek V4 Pro."""
+    """Escalate complex local-coder requests to DeepSeek V4 Pro; optionally
+    de-escalate trivial glm-planner turns to DeepSeek (GLM_DEESCALATE=1)."""
     async def async_pre_call_hook(self, user_api_key_dict, cache, data: dict, call_type: str):
         if call_type not in _HOOKED_CALL_TYPES:
             return data
 
-        if "local-coder" not in data.get("model", ""):
-            return data
-
+        model = data.get("model", "")
         messages = data.get("messages") or []
         if not messages:
             return data
 
-        if _is_complex_task(messages):
-            data["model"] = "ds-coder"
-            _strip_english(data)  # DeepSeek doesn't need the language pin
+        # Escalate: Qwen (local-coder) → DeepSeek when the task is complex/large.
+        if "local-coder" in model:
+            if _is_complex_task(messages):
+                data["model"] = "ds-coder"
+                _strip_english(data)  # DeepSeek doesn't need the language pin
+            return data
+
+        # De-escalate: GLM (glm-planner) → DeepSeek for small, simple turns only.
+        if _GLM_DEESCALATE and "glm-planner" in model:
+            total_tokens = _estimate_tokens(
+                sum(len(_blocks_text(m.get("content", ""))) for m in messages))
+            latest = _last_user_text(messages).lower()
+            is_complex = any(kw in latest for kw in _COMPLEX_INDICATORS)
+            if total_tokens < _DEESCALATE_MAX_TOKENS and not is_complex:
+                data["model"] = "ds-coder"
+                _strip_english(data)  # pinner already ran (glm matches); strip it
 
         return data
 

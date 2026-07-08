@@ -2,7 +2,7 @@
 # Expensive AGENTIC brain plans + delegates; cheap hands execute.
 #
 #   ROLE          MODEL          BACKEND            COST/M in-out    WHY
-#   glm-planner   GLM-5.2        Z.ai API           ~$0.56-1.2 / 1.76-4.4  orchestrator: near-Opus agentic (MCP-Atlas 77 vs 77.8)
+#   glm-planner   GLM-5.2        Z.ai API           $1.40 / $4.40 (cache $0.26) orchestrator: near-Opus agentic (MCP-Atlas 77 vs 77.8)
 #   ds-coder      DeepSeek V4Pro deepseek.com       $0.44 / $0.87    heavy executor: best cheap coder (SWE-Verified 80.6, LiveCodeBench 93.5)
 #   local-coder   Qwen3-Coder    LM Studio (local)  free             mechanical executor + quick tasks
 #   claude-smart  Sonnet 5       anthropic.com      $3 / $15*        frontier escalation (/model opus) when stuck
@@ -40,19 +40,26 @@ model_list:
       rpm: 30
     model_info:
       mode: chat
-      max_input_tokens: 200000
+      max_input_tokens: 1000000      # GLM-5.2 is a 1M-context model (see header). Was 200000 —
+                                     # a stale copy from the Sonnet tier that made pre_call_checks
+                                     # 400 any request >200k ("no model large enough") instead of routing it.
       max_output_tokens: 65536
-      # Fallback estimate only — z.ai returns real response_cost per call (that's
-      # what usage.db logs). Set to OBSERVED effective rate from usage.db 2026-07-06
-      # ($0.144/M blended, cache-heavy) so the rare fallback path isn't 4x high.
-      input_cost_per_token: 0.00000015    # ~$0.15/M observed effective (list ~$0.56, caching pulls it down)
-      output_cost_per_token: 0.00000176   # $1.76/M
+      # z.ai does NOT return a cost field (verified: /chat/completions usage has
+      # only token counts). LiteLLM computes cost SOLELY from these prices, so they
+      # must be z.ai's real list rates (https://docs.z.ai/guides/overview/pricing).
+      # The previous $0.15/M "observed effective" rate was circular — derived from a
+      # config that billed cached tokens at $0 — and under-reported GLM by ~16x
+      # ($1 shown vs ~$17 actually spent). Caching is a DISCOUNT ($0.26/M), NOT free.
+      input_cost_per_token: 0.0000014            # $1.40/M  (uncached input)
+      cache_read_input_token_cost: 0.00000026    # $0.26/M  (cached input — was unset → billed $0)
+      output_cost_per_token: 0.0000044           # $4.40/M
 
-  # ── TIER 0 · local-coder — Qwen3 Coder 30B (free, LM Studio :1234) ──
+  # ── TIER 0 · local-coder — Qwen3 Coder 30B (free, llama.cpp :8080) ──
+  # Local llama.cpp OpenAI-compatible server (Strix Halo iGPU, Vulkan).
   - model_name: local-coder
     litellm_params:
-      model: lm_studio/qwen/qwen3-coder-30b
-      api_base: http://127.0.0.1:1234/v1
+      model: openai/qwen3-coder-30b
+      api_base: http://127.0.0.1:8080/v1
       api_key: "sk-noop"
       timeout: 600
     model_info:
@@ -78,8 +85,13 @@ model_list:
       mode: chat
       max_input_tokens: 1000000
       max_output_tokens: 8192
-      input_cost_per_token: 0.000000435   # $0.435/M
-      output_cost_per_token: 0.00000087   # $0.87/M
+      # deepseek.com also returns NO cost field — litellm prices from these.
+      # These are the permanent list rates (75% cut made permanent 2026-05-22).
+      # DeepSeek's cache-hit is near-free ($0.003625/M — 120x cheaper than z.ai's
+      # $0.26/M), so its caching saves far more than GLM's. See docs.
+      input_cost_per_token: 0.000000435          # $0.435/M   (cache-miss input)
+      cache_read_input_token_cost: 0.000000003625 # $0.003625/M (cache-hit input — was unset → billed $0)
+      output_cost_per_token: 0.00000087          # $0.87/M
 
   # ── TIER 2 · claude-smart — Anthropic Sonnet 5 (needs ANTHROPIC_API_KEY) ──
   # A real console.anthropic.com key, NOT Claude Max (Max can't proxy).

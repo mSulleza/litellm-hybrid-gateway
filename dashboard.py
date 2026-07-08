@@ -60,17 +60,24 @@ def gather():
         today = today_row["d"]
 
         # ---- totals ----
+        has_cached = _has_col(c, "cached_tokens")
+        cached_sel = "COALESCE(SUM(cached_tokens),0)" if has_cached else "0"
         t = c.execute(
             "SELECT COUNT(*) n, COALESCE(SUM(cost),0) c, "
-            "COALESCE(SUM(input_tokens),0) i, COALESCE(SUM(output_tokens),0) o FROM usage"
+            "COALESCE(SUM(input_tokens),0) i, COALESCE(SUM(output_tokens),0) o, "
+            f"{cached_sel} cached FROM usage"
         ).fetchone()
         out["totals"] = {
             "requests": t["n"],
             "cost": t["c"],
             "input_tokens": t["i"],
             "output_tokens": t["o"],
+            "cached_tokens": t["cached"],
             "total_tokens": t["i"] + t["o"],
             "avg_cost_per_req": (t["c"] / t["n"]) if t["n"] else 0.0,
+            # Share of INPUT tokens served from cache. On z.ai a miss costs 5.4x a
+            # hit ($1.40 vs $0.26/M), so a drop here means cost is about to spike.
+            "cache_hit_pct": (t["cached"] / t["i"]) if t["i"] else 0.0,
         }
 
         # ---- today ----
@@ -83,7 +90,8 @@ def gather():
         # ---- by model (cost-desc) ----
         mods = c.execute(
             "SELECT model_group, COUNT(*) n, COALESCE(SUM(cost),0) c, "
-            "COALESCE(SUM(input_tokens),0) i, COALESCE(SUM(output_tokens),0) o "
+            "COALESCE(SUM(input_tokens),0) i, COALESCE(SUM(output_tokens),0) o, "
+            f"{cached_sel} cached "
             "FROM usage GROUP BY model_group ORDER BY c DESC"
         ).fetchall()
         total_cost = t["c"] or 1.0
@@ -97,9 +105,11 @@ def gather():
                 "cost": r["c"],
                 "input_tokens": r["i"],
                 "output_tokens": r["o"],
+                "cached_tokens": r["cached"],
                 "total_tokens": tok,
                 "pct_cost": r["c"] / total_cost,
                 "pct_requests": r["n"] / total_req,
+                "cache_hit_pct": (r["cached"] / r["i"]) if r["i"] else 0.0,
                 "cost_per_1k": (r["c"] / tok * 1000.0) if tok else 0.0,
                 "color": PALETTE[i % len(PALETTE)],
             })
@@ -252,6 +262,7 @@ HTML = r"""<!DOCTYPE html>
 <script>
 const fmt$=n=>'$'+(n||0).toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:4});
 const fmtN=n=>(n||0).toLocaleString();
+const fmtPct=n=>((n||0)*100).toFixed(0)+'%';
 const short=m=>(m||'?').split('/').pop();
 let charts={}, lastUpdated=null;
 function getStats(){ return window.__STATS__ ? Promise.resolve(window.__STATS__) : fetch('/api/stats').then(r=>r.json()); }
@@ -260,6 +271,8 @@ function kpis(t){
     ['Total cost',fmt$(t.totals.cost), t.today.cost>0?fmt$(t.today.cost)+' today':'no spend today'],
     ['Requests',fmtN(t.totals.requests), fmtN(t.today.requests)+' today'],
     ['Tokens',fmtN(t.totals.total_tokens), fmtN(t.totals.input_tokens)+' in · '+fmtN(t.totals.output_tokens)+' out'],
+    ['Cache hit rate',fmtPct(t.totals.cache_hit_pct),
+      fmtN(t.totals.cached_tokens)+' of '+fmtN(t.totals.input_tokens)+' input cached'],
     ['Avg $/request',fmt$(t.totals.avg_cost_per_req), fmtN(t.totals.total_tokens)+' tokens total'],
     ['Models used',fmtN(t.by_model.length), t.by_model.map(m=>short(m.model)).join(', ')||'—'],
     ['Sessions',fmtN((t.by_session||[]).filter(x=>x.session!=='unknown').length),
@@ -296,17 +309,20 @@ function render(s){
         {label:'Output',data:s.by_model.map(m=>m.output_tokens),backgroundColor:'#34d399'}]},
       options:{plugins:{legend:{labels:{color:'#8b93a7',font:{size:11}}}},scales:{x:{ticks:{color:'#8b93a7'},grid:{display:false}},y:{ticks:{color:'#8b93a7'},grid:{color:'#272b35'},beginAtZero:true}}}});
   }
-  document.getElementById('modelTable').innerHTML=`<table><thead><tr><th>Model</th><th class="num">Req</th><th class="num">Cost</th><th class="num">$ /1K tok</th><th>Share</th></tr></thead><tbody>${s.by_model.map(m=>`<tr>
+  document.getElementById('modelTable').innerHTML=`<table><thead><tr><th>Model</th><th class="num">Req</th><th class="num">Cost</th><th class="num">$ /1K tok</th><th class="num">Cache</th><th>Share</th></tr></thead><tbody>${s.by_model.map(m=>`<tr>
     <td><span class="chip" style="background:${m.color}22;color:${m.color}">${short(m.model)}</span></td>
     <td class="num">${fmtN(m.requests)}</td><td class="num">${fmt$(m.cost)}</td><td class="num">${fmt$(m.cost_per_1k)}</td>
+    <td class="num" title="${fmtN(m.cached_tokens)} of ${fmtN(m.input_tokens)} input cached">${m.input_tokens?fmtPct(m.cache_hit_pct):'—'}</td>
     <td><div style="color:var(--muted);font-size:12px">${(m.pct_cost*100).toFixed(1)}% cost</div><div class="bar"><div style="width:${m.pct_cost*100}%;background:${m.color}"></div></div></td></tr>`).join('')}</tbody></table>`;
   const sess=s.by_session||[];
   if(!sess.length){ document.getElementById('sessionTable').innerHTML='<div class="empty">No sessions tracked yet.</div>'; }
-  else { document.getElementById('sessionTable').innerHTML=`<table><thead><tr><th>Session</th><th>Started</th><th>Models</th><th class="num">Req</th><th class="num">In</th><th class="num">Out</th><th class="num">Cost</th><th>Share</th></tr></thead><tbody>${sess.map(x=>`<tr>
+  else { document.getElementById('sessionTable').innerHTML=`<table><thead><tr><th>Session</th><th>Started</th><th>Models</th><th class="num">Req</th><th class="num">In</th><th class="num">Out</th><th class="num">Cache</th><th class="num">Cost</th><th>Share</th></tr></thead><tbody>${sess.map(x=>`<tr>
     <td title="${x.session}"><code style="font-size:12px">${x.label}</code></td>
     <td style="color:var(--muted)">${x.started}</td>
     <td>${x.models.map((m,i)=>`<span class="chip" style="background:${(x.colors[i]||'#64748b')}22;color:${x.colors[i]||'#64748b'};margin-right:3px">${m}</span>`).join('')}</td>
-    <td class="num">${fmtN(x.requests)}</td><td class="num">${fmtN(x.input_tokens)}</td><td class="num">${fmtN(x.output_tokens)}</td><td class="num">${fmt$(x.cost)}</td>
+    <td class="num">${fmtN(x.requests)}</td><td class="num">${fmtN(x.input_tokens)}</td><td class="num">${fmtN(x.output_tokens)}</td>
+    <td class="num" title="${fmtN(x.cached_tokens)} of ${fmtN(x.input_tokens)} input cached">${x.input_tokens?fmtPct(x.cached_tokens/x.input_tokens):'—'}</td>
+    <td class="num">${fmt$(x.cost)}</td>
     <td><div style="color:var(--muted);font-size:12px">${(x.pct_cost*100).toFixed(1)}%</div><div class="bar"><div style="width:${x.pct_cost*100}%;background:var(--accent)"></div></div></td></tr>`).join('')}</tbody></table>`; }
   if(!s.recent.length){ document.getElementById('recent').innerHTML='<div class="empty">No requests logged yet.</div>'; }
   else { document.getElementById('recent').innerHTML=`<table><thead><tr><th>Time</th><th>Model</th><th class="num">In</th><th class="num">Out</th><th class="num">Cost</th><th>Prompt</th></tr></thead><tbody>${s.recent.map(r=>`<tr>
