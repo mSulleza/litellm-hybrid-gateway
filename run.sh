@@ -1,4 +1,4 @@
-#!/bin/zsh
+#!/usr/bin/env bash
 set -euo pipefail
 source "$HOME/litellm/litellm.env"
 cd "$HOME/litellm"

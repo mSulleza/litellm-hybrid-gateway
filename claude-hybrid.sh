@@ -1,4 +1,4 @@
-#!/bin/zsh
+#!/usr/bin/env bash
 # Launch Claude Code through the local LiteLLM gateway (Qwen + DeepSeek).
 # Plain `claude` stays on your Claude Max subscription — this script only
 # affects the session it launches.
@@ -38,19 +38,11 @@ if ! grep -q "ANTHROPIC_API_KEY" "$HOME/litellm/litellm.env" 2>/dev/null; then
   echo "      Add a console.anthropic.com API key, then restart the proxy." >&2
 fi
 
-# Qwen must be loaded with a big context or every call channel-errors
-# and silently falls back to DeepSeek (= no savings).
-CTX=$(curl -s -m 3 http://127.0.0.1:1234/api/v0/models | /usr/bin/python3 -c "
-import json,sys
-try:
-    ms=[m for m in json.load(sys.stdin)['data'] if 'qwen3-coder' in m.get('id','')]
-    print(ms[0].get('loaded_context_length') or 0 if ms else 0)
-except Exception: print(0)" 2>/dev/null || echo 0)
-if [ "${CTX:-0}" -lt 65536 ]; then
-  echo "Qwen context is ${CTX:-unloaded} (<65536). Fixing: lms load qwen/qwen3-coder-30b --context-length 65536 --gpu max" >&2
-  "$HOME/.lmstudio/bin/lms" load qwen/qwen3-coder-30b --context-length 65536 --gpu max --yes >&2 || {
-    echo "Could not load Qwen — local requests will fall back to DeepSeek." >&2
-  }
+# Local Qwen is served by llama.cpp on :8080 (Strix Halo iGPU). Just check it's
+# up — if not, local requests fall back to DeepSeek (see config.yaml fallbacks).
+if ! curl -s -m 3 -o /dev/null "http://127.0.0.1:8080/v1/models"; then
+  echo "Note: local llama.cpp not responding on :8080 — local-coder requests will" >&2
+  echo "      fall back to DeepSeek (no free tier). Start your llama.cpp server." >&2
 fi
 
 # Proxy is required — fail fast with a clear message instead of hanging.

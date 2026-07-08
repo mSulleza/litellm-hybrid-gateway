@@ -1,4 +1,4 @@
-#!/bin/zsh
+#!/usr/bin/env bash
 # Cost & usage summary for the LiteLLM gateway.
 # Reads ~/litellm/usage.db (written by the cost_logger callback).
 #   usage.sh          → today + last 7 days + by-model all-time + recent requests

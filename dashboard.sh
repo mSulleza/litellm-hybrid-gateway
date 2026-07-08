@@ -1,4 +1,4 @@
-#!/bin/zsh
+#!/usr/bin/env bash
 # Open the LiteLLM usage dashboard in a browser.
 # Starts a local server (default :4040) serving ~/litellm/usage.db live, then
 # opens the page. Ctrl-C stops the server. Pass a port: `dashboard.sh 5050`.
@@ -29,5 +29,5 @@ for i in {1..20}; do
   sleep 0.25
 done
 
-open "http://127.0.0.1:${PORT}"
+( xdg-open "http://127.0.0.1:${PORT}" >/dev/null 2>&1 ) || echo "Open http://127.0.0.1:${PORT} in your browser."
 wait "$SRV"
